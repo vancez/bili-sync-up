@@ -40,7 +40,6 @@ pub struct Movie<'a> {
     pub like_count: Option<i64>,                   // 点赞数
     pub category: i32,                             // 视频分类（用于番剧检测）
     pub tagline: Option<String>,                   // 标语/副标题（从share_copy提取）
-    pub set: Option<String>,                       // 系列名称
     pub sorttitle: Option<String>,                 // 排序标题
     pub uniqueid_override: Option<String>,         // 覆盖uniqueid内容（用于章节独立条目）
     pub actors_info: Option<String>,               // 演员信息字符串（从API获取，番剧用）
@@ -72,7 +71,6 @@ pub struct TVShow<'a> {
     pub like_count: Option<i64>,
     pub category: i32,                             // 视频分类（用于番剧检测）
     pub tagline: Option<String>,                   // 标语/副标题（从share_copy提取）
-    pub set: Option<String>,                       // 系列名称
     pub sorttitle: Option<String>,                 // 排序标题
     pub actors_info: Option<String>,               // 演员信息字符串（从API获取，番剧用）
     pub staff_info: Option<&'a serde_json::Value>, // 联合投稿成员信息（JSON格式）
@@ -295,20 +293,6 @@ impl NFO<'_> {
                     writer
                         .create_element("sorttitle")
                         .write_text_content_async(BytesText::new(&display_title))
-                        .await?;
-                }
-
-                // 系列信息
-                if let Some(ref set_name) = movie.set {
-                    writer
-                        .create_element("set")
-                        .write_inner_content_async::<_, _, Error>(|writer| async move {
-                            writer
-                                .create_element("name")
-                                .write_text_content_async(BytesText::new(set_name))
-                                .await?;
-                            Ok(writer)
-                        })
                         .await?;
                 }
 
@@ -679,20 +663,6 @@ impl NFO<'_> {
                     writer
                         .create_element("sorttitle")
                         .write_text_content_async(BytesText::new(&sort_title_to_write))
-                        .await?;
-                }
-
-                // 系列信息
-                if let Some(ref set_name) = tvshow.set {
-                    writer
-                        .create_element("set")
-                        .write_inner_content_async::<_, _, Error>(|writer| async move {
-                            writer
-                                .create_element("name")
-                                .write_text_content_async(BytesText::new(set_name))
-                                .await?;
-                            Ok(writer)
-                        })
                         .await?;
                 }
 
@@ -1406,20 +1376,6 @@ impl NFO<'_> {
                         .await?;
                 }
 
-                // 系列信息
-                if let Some(ref set_name) = season.set {
-                    writer
-                        .create_element("set")
-                        .write_inner_content_async::<_, _, Error>(|writer| async move {
-                            writer
-                                .create_element("name")
-                                .write_text_content_async(BytesText::new(set_name))
-                                .await?;
-                            Ok(writer)
-                        })
-                        .await?;
-                }
-
                 // 剧情简介 - 为Season添加季度特定的前缀
                 let season_plot_base = season.intro.to_string();
                 let season_plot = if Self::is_bangumi_video(season.category) {
@@ -2004,13 +1960,6 @@ impl<'a> From<&'a video::Model> for Movie<'a> {
             }
         });
 
-        // 对于番剧，尝试提取系列名称
-        let set_name = if NFO::is_bangumi_video(video.category) {
-            NFO::extract_bangumi_title_from_full_name(nfo_title)
-        } else {
-            None
-        };
-
         Self {
             name: nfo_title,
             original_title: &video.name,
@@ -2035,7 +1984,6 @@ impl<'a> From<&'a video::Model> for Movie<'a> {
             like_count: None,  // video模型中没有like_count字段
             category: video.category,
             tagline,
-            set: set_name,
             sorttitle,
             uniqueid_override: None,
             actors_info: video.actors.clone(),
@@ -2100,13 +2048,6 @@ impl<'a> From<&'a video::Model> for TVShow<'a> {
             }
         });
 
-        // 对于番剧，尝试提取系列名称
-        let set_name = if NFO::is_bangumi_video(video.category) {
-            NFO::extract_bangumi_title_from_full_name(nfo_title)
-        } else {
-            None
-        };
-
         Self {
             name: nfo_title,
             original_title: &video.name,
@@ -2140,7 +2081,6 @@ impl<'a> From<&'a video::Model> for TVShow<'a> {
             like_count: None,     // video模型中没有like_count字段
             category: video.category,
             tagline,
-            set: set_name,
             sorttitle,
             actors_info: video.actors.clone(),
             staff_info: video.staff_info.as_ref(),
@@ -2196,9 +2136,6 @@ impl<'a> TVShow<'a> {
 
         tvshow.total_seasons = Some(total_seasons.unwrap_or(safe_season).max(1));
         tvshow.total_episodes = total_episodes.map(|v| v.max(1));
-        if let Some(name) = collection_name {
-            tvshow.set = Some(name.to_string());
-        }
 
         tvshow
     }
@@ -2314,11 +2251,6 @@ impl<'a> TVShow<'a> {
             like_count: season_info.total_favorites,
             category: video.category,
             tagline: season_info.alias.as_deref().map(|s| s.to_string()),
-            set: if NFO::is_bangumi_video(video.category) {
-                NFO::extract_bangumi_title_from_full_name(&season_info.title)
-            } else {
-                Some(season_info.title.clone())
-            }, // 系列名称（清理季度信息）
             sorttitle: Some(season_info.title.clone()),
             actors_info: season_info.actors.clone(),
             staff_info: video.staff_info.as_ref(), // 番剧一般使用actors_info，staff_info作为备选
@@ -2392,9 +2324,16 @@ impl<'a> Episode<'a> {
         let config = crate::config::reload_config();
         let use_unified_season = is_bangumi && config.bangumi_use_season_structure;
 
-        // 启用Season结构时，统一使用season=1；否则使用原始season_number
+        // 启用Season结构时，从番剧标题提取季度编号（与文件夹/文件名命名保持一致，
+        // 如 "灵笼 第二季" -> 2，避免 Season 02/03 目录内的分集 nfo 季号恒为 1）；
+        // 否则使用原始season_number
         let season_number = if use_unified_season {
-            1
+            let (_, extracted_season) =
+                crate::utils::bangumi_name_extractor::BangumiNameExtractor::extract_series_name_and_season(
+                    &video.name,
+                    None,
+                );
+            extracted_season as i32
         } else {
             video.season_number.unwrap_or(1)
         };
@@ -2820,7 +2759,6 @@ mod tests {
             like_count: None,
             category: 0,
             tagline: None,
-            set: None,
             sorttitle: None,
             uniqueid_override: None,
             actors_info: None,
@@ -2859,7 +2797,6 @@ mod tests {
             like_count: None,
             category: 0,
             tagline: None,
-            set: None,
             sorttitle: None,
             actors_info: None,
             staff_info: None,
@@ -3412,7 +3349,6 @@ mod tests {
 
         // 验证新字段被正确设置
         assert_eq!(movie.tagline, Some("柯南剧场版开山之作".to_string()));
-        assert_eq!(movie.set, Some("名侦探柯南 计时引爆摩天楼".to_string()));
         assert!(movie.sorttitle.is_some());
 
         let movie_nfo = NFO::Movie((&video).into()).generate_nfo().await.unwrap();
@@ -3420,8 +3356,8 @@ mod tests {
         // 验证NFO包含新字段
         assert!(movie_nfo.contains("<tagline>柯南剧场版开山之作</tagline>"));
         assert!(movie_nfo.contains("<sorttitle>名侦探柯南 计时引爆摩天楼</sorttitle>"));
-        assert!(movie_nfo.contains("<set>"));
-        assert!(movie_nfo.contains("<name>名侦探柯南 计时引爆摩天楼</name>"));
+        // 不生成set元素，避免Emby创建合集
+        assert!(!movie_nfo.contains("<set>"));
 
         // 验证标题提取
         assert!(movie_nfo.contains("<title>名侦探柯南 计时引爆摩天楼</title>"));
@@ -3780,12 +3716,8 @@ mod tests {
             "Season NFO应该包含正确的季度编号"
         );
 
-        // 验证Season NFO的set使用系列名称（不含季度信息）
-        assert!(season_nfo.contains("<set>"), "Season NFO应该包含set信息");
-        assert!(
-            season_nfo.contains("<name>灵笼</name>"),
-            "Season NFO的set应该使用清理后的系列名称"
-        );
+        // 不生成set元素，避免Emby创建合集
+        assert!(!season_nfo.contains("<set>"), "Season NFO不应包含set信息");
 
         println!("Season标题修复测试通过");
     }
@@ -3832,11 +3764,8 @@ mod tests {
             "Season NFO应该包含正确的季度编号"
         );
 
-        assert!(season_nfo.contains("<set>"), "Season NFO应该包含set信息");
-        assert!(
-            season_nfo.contains("<name>灵笼</name>"),
-            "Season NFO的set应该使用清理后的系列名称"
-        );
+        // 不生成set元素，避免Emby创建合集
+        assert!(!season_nfo.contains("<set>"), "Season NFO不应包含set信息");
 
         // 验证Season专属的plot前缀
         assert!(
@@ -3923,13 +3852,10 @@ mod tests {
             "season.nfo sorttitle 不应保留合集前缀"
         );
         assert!(
-            season_nfo.contains("<name>童年动漫主题曲翻唱合集</name>"),
-            "season.nfo set/name 不应保留合集前缀"
-        );
-        assert!(
             !season_nfo.contains("合集·童年动漫主题曲翻唱合集"),
             "season.nfo 中不应再出现自动添加的合集前缀"
         );
+        assert!(!season_nfo.contains("<set>"), "season.nfo 不应包含 set 元素");
     }
 
     #[tokio::test]

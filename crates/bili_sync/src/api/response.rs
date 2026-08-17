@@ -483,6 +483,7 @@ pub struct ConfigResponse {
     pub interval: u64,
     pub nfo_time_type: String,
     pub nfo_include_genre: bool,
+    pub nfo_include_bilibili_info: bool,
     // 多线程下载配置
     pub parallel_download_enabled: bool,
     pub parallel_download_threads: usize,

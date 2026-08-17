@@ -1244,6 +1244,7 @@ mod reset_path_tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn remap_existing_video_dir_to_new_base_is_case_insensitive_on_windows() {
         let remapped = remap_existing_video_dir_to_new_base(
@@ -6412,8 +6413,16 @@ async fn cleanup_empty_season_dirs(
             let season_asset_prefix = season_name.replace(' ', "");
             for suffix in ["thumb", "fanart", "poster"] {
                 for ext in ["jpg", "jpeg", "png", "webp"] {
+                    // 旧布局：系列根目录下的 SeasonNN-*.jpg（带季号前缀）
                     remove_file_if_exists(
                         &root_dir.join(format!("{}-{}.{}", season_asset_prefix, suffix, ext)),
+                        deleted_count,
+                        "Season封面文件",
+                    )
+                    .await;
+                    // 新布局：Season 目录内的 thumb/fanart/poster.jpg
+                    remove_file_if_exists(
+                        &season_dir.join(format!("{}.{}", suffix, ext)),
                         deleted_count,
                         "Season封面文件",
                     )
@@ -10118,6 +10127,7 @@ pub async fn get_config() -> Result<ApiResponse<crate::api::response::ConfigResp
         interval: config.interval,
         nfo_time_type: nfo_time_type.to_string(),
         nfo_include_genre: config.nfo_config.include_genre,
+        nfo_include_bilibili_info: config.nfo_config.include_bilibili_info,
         parallel_download_enabled: config.concurrent_limit.parallel_download.enabled,
         parallel_download_threads: config.concurrent_limit.parallel_download.threads,
         parallel_download_use_aria2: config.concurrent_limit.parallel_download.use_aria2,
@@ -10712,6 +10722,7 @@ pub async fn update_config(
             interval: params.interval,
             nfo_time_type: params.nfo_time_type.clone(),
             nfo_include_genre: params.nfo_include_genre,
+            nfo_include_bilibili_info: params.nfo_include_bilibili_info,
             parallel_download_enabled: params.parallel_download_enabled,
             parallel_download_threads: params.parallel_download_threads,
             parallel_download_use_aria2: params.parallel_download_use_aria2,
@@ -11093,6 +11104,7 @@ pub async fn update_config_internal(
     let mut updated_fields = Vec::new();
 
     let original_nfo_include_genre = config.nfo_config.include_genre;
+    let original_nfo_include_bilibili_info = config.nfo_config.include_bilibili_info;
 
     // 记录原始的命名相关配置，用于比较是否真正发生了变化
     let original_collection_folder_mode = config.collection_folder_mode.clone();
@@ -11264,6 +11276,13 @@ pub async fn update_config_internal(
         if original_nfo_include_genre != nfo_include_genre {
             config.nfo_config.include_genre = nfo_include_genre;
             updated_fields.push("nfo_include_genre");
+        }
+    }
+
+    if let Some(nfo_include_bilibili_info) = params.nfo_include_bilibili_info {
+        if original_nfo_include_bilibili_info != nfo_include_bilibili_info {
+            config.nfo_config.include_bilibili_info = nfo_include_bilibili_info;
+            updated_fields.push("nfo_include_bilibili_info");
         }
     }
 
@@ -12328,6 +12347,11 @@ pub async fn update_config_internal(
                         .await
                 }
                 "nfo_include_genre" => {
+                    manager
+                        .update_config_item("nfo_config", serde_json::to_value(&config.nfo_config)?)
+                        .await
+                }
+                "nfo_include_bilibili_info" => {
                     manager
                         .update_config_item("nfo_config", serde_json::to_value(&config.nfo_config)?)
                         .await

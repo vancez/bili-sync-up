@@ -334,6 +334,7 @@ export interface ConfigResponse {
 	interval: number;
 	nfo_time_type: string;
 	nfo_include_genre: boolean;
+	nfo_include_bilibili_info: boolean;
 	parallel_download_enabled: boolean;
 	parallel_download_threads: number;
 	parallel_download_use_aria2: boolean;
@@ -517,6 +518,7 @@ export interface UpdateConfigRequest {
 	interval?: number;
 	nfo_time_type?: string;
 	nfo_include_genre?: boolean;
+	nfo_include_bilibili_info?: boolean;
 	parallel_download_enabled?: boolean;
 	parallel_download_threads?: number;
 	parallel_download_use_aria2?: boolean;

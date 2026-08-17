@@ -221,6 +221,8 @@ pub struct UpdateConfigRequest {
     pub nfo_time_type: Option<String>,
     // NFO是否写入genre标签
     pub nfo_include_genre: Option<bool>,
+    // NFO是否写入B站特有信息（播放量、点赞数等）
+    pub nfo_include_bilibili_info: Option<bool>,
     // 多线程下载配置
     pub parallel_download_enabled: Option<bool>,
     pub parallel_download_threads: Option<usize>,

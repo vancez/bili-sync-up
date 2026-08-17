@@ -1469,6 +1469,13 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
+    /// update_pages_model 使用进程级全局队列 + 单 worker：worker 由第一个入队者 spawn，
+    /// 并在**它的**数据库连接上执行队列里所有请求。多个测试并行调用时，请求会被
+    /// 执行到错误的测试库（找不到行 → “None of the records are updated”）或按 page_id
+    /// 去重互相覆盖。因此所有调用 update_pages_model 的测试必须持锁串行执行。
+    static PAGE_UPDATE_TESTS_SERIAL_LOCK: once_cell::sync::Lazy<tokio::sync::Mutex<()>> =
+        once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(()));
+
     fn unique_temp_dir(prefix: &str) -> PathBuf {
         let mut dir = std::env::temp_dir();
         dir.push(format!("bili-sync-model-{}-{}", prefix, uuid::Uuid::new_v4()));
@@ -1710,6 +1717,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_pages_model_updates_page_sizes_without_recomputing_video_total_file_size_bytes() {
+        let _serial_guard = PAGE_UPDATE_TESTS_SERIAL_LOCK.lock().await;
         let db = create_test_db("update-page-sizes").await;
         insert_test_video(&db, 1, "测试视频").await;
         insert_test_page(&db, 1, 1, Some("/tmp/page-1.m4s".to_string())).await;
@@ -1753,6 +1761,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_pages_model_handles_concurrent_single_page_updates() {
+        let _serial_guard = PAGE_UPDATE_TESTS_SERIAL_LOCK.lock().await;
         let db = create_test_db("update-page-concurrent").await;
         insert_test_video(&db, 1, "测试视频").await;
         insert_test_page(&db, 1, 1, Some("/tmp/page-1.m4s".to_string())).await;

@@ -1117,6 +1117,21 @@ fn is_submission_ugc_collection_video(video_source: &VideoSourceEnum, video_mode
             .unwrap_or(false)
 }
 
+/// 分离模式且未开启"合集使用Season文件夹结构"时，合集类视频按普通视频（视频级）格式生成 .nfo。
+/// 单P → Movie NFO；多P → 普通多P处理（根目录 TVShow nfo + 分P Episode 用 pid 编号）。
+/// 选项开启（或聚合/up_seasonal 隐含开启）时行为完全不变（Episode NFO + Season 文件夹）。
+fn collection_video_level_format(video_source: &VideoSourceEnum, video_model: &video::Model) -> bool {
+    let config = crate::config::reload_config();
+    if config.collection_folder_mode.as_ref() != "separate" || config.collection_use_season_structure {
+        return false;
+    }
+    match video_source {
+        VideoSourceEnum::Collection(source) => !source.aggregate_enabled,
+        VideoSourceEnum::Submission(_) => is_submission_ugc_collection_video(video_source, video_model),
+        _ => false,
+    }
+}
+
 // 新增：番剧季信息结构体
 #[derive(Debug, Clone)]
 pub struct SeasonInfo {
@@ -3825,6 +3840,9 @@ async fn download_video_pages(
     // 统一“合集类视频”判定：真实合集源 + 投稿源中的UGC合集视频
     let is_collection = is_collection_source || is_submission_collection_video;
 
+    // 分离模式且未开启“合集使用Season文件夹结构”时，合集类视频按普通视频（视频级）格式生成 .nfo
+    let collection_video_level_format_active = collection_video_level_format(video_source, &final_video_model);
+
     // 为番剧获取API数据用于NFO生成
     let season_info = if is_bangumi && video_model.season_id.is_some() {
         let season_id = video_model.season_id.as_ref().unwrap();
@@ -4486,7 +4504,7 @@ async fn download_video_pages(
     }
 
     // 平铺目录模式下（番剧/合集/多P），跳过 TVShow/Season 目录结构相关的元数据文件
-    // - 不下载：tvshow.nfo、poster.jpg、folder.jpg、Season01-*.jpg、*-thumb.jpg、*-fanart.jpg
+    // - 不下载：tvshow.nfo、poster.jpg、folder.jpg、Season 目录封面、*-thumb.jpg、*-fanart.jpg
     let m4a_only_mode = video_source.audio_only() && video_source.audio_only_m4a_only();
     let disable_tvshow_assets = m4a_only_mode || (flat_folder && (is_bangumi || is_collection || !is_single_page));
     if disable_tvshow_assets {
@@ -4520,8 +4538,9 @@ async fn download_video_pages(
             let uses_season_structure = collection_use_root_season_structure || multi_page_like_use_season_structure;
 
             if uses_season_structure && season_folder.is_some() {
-                // 对于合集，只有第一个视频才下载合集封面
-                if is_collection {
+                // 对于合集，只有第一个视频才下载合集封面；
+                // 视频级格式模式下按普通多P处理，不限制首视频
+                if is_collection && !collection_video_level_format_active {
                     match video_source {
                         VideoSourceEnum::Collection(collection_source) => {
                             let season_asset_missing = season_folder
@@ -4608,9 +4627,11 @@ async fn download_video_pages(
         && !is_submission_collection_video
         && !is_single_page
         && crate::config::reload_config().collection_folder_mode.as_ref() == "up_seasonal";
-    let collection_like_nfo_route = (is_collection && collection_use_season_structure)
+    // 视频级格式模式下合集不走集合级 NFO 路由（tvshow.nfo/season.nfo/backfill），与普通视频一致
+    let collection_like_nfo_route = ((is_collection && collection_use_season_structure)
         || submission_up_seasonal_nfo_route
-        || multi_page_use_season_nfo_route;
+        || multi_page_use_season_nfo_route)
+        && !collection_video_level_format_active;
 
     // 合集/多P Season结构下，若目录级元数据缺失，允许本轮任意分集补齐。
     let should_backfill_collection_root_assets =
@@ -4653,6 +4674,9 @@ async fn download_video_pages(
         let should_generate_nfo = if is_bangumi {
             // 番剧：只有在文件不存在时才生成，放在番剧文件夹根目录
             should_run_video_nfo && bangumi_folder_path.is_some() && should_download_bangumi_nfo
+        } else if collection_video_level_format_active {
+            // 分离模式且未开启“合集使用Season文件夹结构”：合集类视频按普通视频处理
+            should_run_video_nfo && (!is_single_page || split_chapters_use_season_structure) && !disable_tvshow_assets
         } else if is_collection || submission_up_seasonal_nfo_route {
             // 合集：只有第一个视频时生成tvshow.nfo
             if !disable_tvshow_assets && should_run_video_nfo && collection_use_season_structure {
@@ -5013,8 +5037,11 @@ async fn download_video_pages(
     };
 
     // 合集根目录封面、季级封面缺失时，都需要优先准备合集列表接口返回的 collection.cover。
+    // 视频级格式模式下按普通视频处理，根封面使用视频自身封面。
     let should_prepare_collection_cover =
-        is_collection && (should_download_season_poster || should_backfill_collection_root_assets);
+        is_collection
+            && !collection_video_level_format_active
+            && (should_download_season_poster || should_backfill_collection_root_assets);
 
     // 预先获取合集封面URL（如果需要）
     let collection_cover_url = if should_prepare_collection_cover {
@@ -5184,15 +5211,16 @@ async fn download_video_pages(
                 );
             let season_number = extracted_season_number;
 
-            // 季度级图片应该放在系列根目录，使用标准命名
+            // 季度级图片放在对应的 Season 目录内，使用标准命名（无季号前缀，Emby 标准布局）
             let series_root = bangumi_folder_path.as_ref().unwrap();
-            let poster_path = series_root.join(format!("Season{:02}-thumb.jpg", season_number));
-            let fanart_path = series_root.join(format!("Season{:02}-fanart.jpg", season_number));
+            let season_root = base_path.clone(); // Season NN 目录
+            let poster_path = season_root.join("thumb.jpg");
+            let fanart_path = season_root.join("fanart.jpg");
 
             // 定义所有Season级别文件路径
-            let season_poster_path = series_root.join(format!("Season{:02}-poster.jpg", season_number));
+            let season_poster_path = season_root.join("poster.jpg");
 
-            // Emby兼容性：添加folder.jpg和poster.jpg
+            // Emby兼容性：系列根目录保留 folder.jpg 和 poster.jpg
             let folder_path = series_root.join("folder.jpg");
             let generic_poster_path = series_root.join("poster.jpg");
 
@@ -5200,7 +5228,7 @@ async fn download_video_pages(
             let should_download_season_images = separate_status[0];
 
             info!(
-                "准备下载季度级图片到: {:?}, {:?}, {:?}, {:?} 和 {:?}",
+                "准备下载季度级图片到: {:?}, {:?}, {:?}（Season目录）和 {:?}, {:?}（系列根目录）",
                 poster_path, fanart_path, season_poster_path, folder_path, generic_poster_path
             );
 
@@ -5222,12 +5250,18 @@ async fn download_video_pages(
             let season_fanart_url = season_info_ref.cover.as_deref().filter(|s| !s.is_empty());
 
             debug!("Season级别图片选择逻辑:");
-            debug!("  Season{:02}-thumb.jpg URL: {:?}", season_number, season_thumb_url);
-            debug!("  Season{:02}-fanart.jpg URL: {:?}", season_number, season_fanart_url);
+            debug!(
+                "  Season{:02} thumb.jpg URL: {:?}",
+                season_number, season_thumb_url
+            );
+            debug!(
+                "  Season{:02} fanart.jpg URL: {:?}",
+                season_number, season_fanart_url
+            );
 
             // 并行下载五个Season级别的图片文件
             let (thumb_result, fanart_result, poster_result, folder_result, generic_poster_result) = tokio::join!(
-                // Season01-thumb.jpg (横版封面)
+                // Season目录内 thumb.jpg (横版封面)
                 fetch_video_poster(
                     should_download_season_images,
                     &video_model,
@@ -5239,7 +5273,7 @@ async fn download_video_pages(
                     None,             // 不使用fanart URL
                     true,
                 ),
-                // Season01-fanart.jpg (竖版封面)
+                // Season目录内 fanart.jpg (竖版封面)
                 fetch_video_poster(
                     should_download_season_images,
                     &video_model,
@@ -5251,7 +5285,7 @@ async fn download_video_pages(
                     None,              // 不使用fanart URL
                     true,
                 ),
-                // Season01-poster.jpg (竖版封面)
+                // Season目录内 poster.jpg (竖版封面，Emby优先识别；不跳过已存在文件，重置后需可重新下载)
                 fetch_bangumi_poster(
                     should_download_season_images,
                     &video_model,
@@ -5260,8 +5294,9 @@ async fn download_video_pages(
                     token.clone(),
                     season_fanart_url, // 使用竖版封面作为主封面
                     true,
+                    false, // 不跳过已存在的文件，保证重置状态后可重新下载
                 ),
-                // folder.jpg (竖版封面，Emby优先识别)
+                // 系列根目录 folder.jpg (竖版封面，Emby优先识别)
                 fetch_bangumi_poster(
                     should_download_season_images,
                     &video_model,
@@ -5270,8 +5305,9 @@ async fn download_video_pages(
                     token.clone(),
                     season_fanart_url, // 使用竖版封面
                     true,
+                    true, // 根目录共享封面，已存在则跳过
                 ),
-                // poster.jpg (竖版封面，通用封面)
+                // 系列根目录 poster.jpg (竖版封面，通用封面)
                 fetch_bangumi_poster(
                     should_download_season_images,
                     &video_model,
@@ -5280,8 +5316,20 @@ async fn download_video_pages(
                     token.clone(),
                     season_fanart_url, // 使用竖版封面
                     true,
+                    true, // 根目录共享封面，已存在则跳过
                 )
             );
+
+            // 清理旧布局遗留的系列根目录 SeasonNN-* 图片：
+            // 仅当对应的新布局文件（Season 目录内同名文件）已存在时才删除，避免误删仍可用的旧封面。
+            for legacy_suffix in ["thumb", "fanart", "poster"] {
+                let legacy_path = series_root.join(format!("Season{:02}-{}.jpg", season_number, legacy_suffix));
+                let new_path = season_root.join(format!("{}.jpg", legacy_suffix));
+                if legacy_path.exists() && new_path.exists() {
+                    let _ = tokio::fs::remove_file(&legacy_path).await;
+                    debug!("已清理旧版季封面文件: {:?}", legacy_path);
+                }
+            }
 
             // 返回综合结果
             Some(
@@ -5498,6 +5546,7 @@ async fn download_video_pages(
                 None
             },
             allow_collection_asset_video_cover_fallback,
+            true, // 根目录共享封面，已存在则跳过
         ),
     );
     let res_folder_fut = Box::pin(
@@ -5551,6 +5600,7 @@ async fn download_video_pages(
                 None
             },
             allow_collection_asset_video_cover_fallback,
+            true, // 根目录共享封面，已存在则跳过
         ),
     );
     let res_3_fut = Box::pin(
@@ -7040,21 +7090,33 @@ async fn download_page(
         filter_option,
         token.clone(),
     ));
+    // 视频级格式模式下合集类视频按普通视频处理：不传季号/集号覆盖（单P → Movie），
+    // 多P 分页显式使用 pid 作为集号（与普通多P一致，避免回退为合集内序号）。
+    let collection_video_level = collection_video_level_format(video_source, video_model);
+    let season_number_override = if collection_video_level {
+        None
+    } else if matches!(video_source, VideoSourceEnum::Collection(_))
+        || is_submission_collection_video
+        || is_submission_up_seasonal_multipage
+    {
+        Some(collection_season_number)
+    } else {
+        None
+    };
+    let episode_number_override = if collection_video_level && !is_single_page {
+        Some(page_model.pid.max(1))
+    } else {
+        collection_page_episode_number.or(submission_page_episode_number)
+    };
     let res_3_fut = Box::pin(generate_page_nfo(
         separate_status[2],
         video_model,
         &page_model,
         nfo_path,
         connection,
-        if matches!(video_source, VideoSourceEnum::Collection(_))
-            || is_submission_collection_video
-            || is_submission_up_seasonal_multipage
-        {
-            Some(collection_season_number)
-        } else {
-            None
-        },
-        collection_page_episode_number.or(submission_page_episode_number),
+        season_number_override,
+        episode_number_override,
+        collection_video_level,
     ));
     let danmaku_config = crate::config::reload_config();
     let res_4_fut = Box::pin(fetch_page_danmaku(
@@ -7606,6 +7668,30 @@ async fn download_page(
     })
 }
 
+/// 从 thumb 封面路径推导 Emby 兼容的 poster 路径：xxx-thumb.jpg -> xxx-poster.jpg
+fn thumb_to_poster_path(thumb_path: &std::path::Path) -> Option<PathBuf> {
+    let stem = thumb_path.file_stem()?.to_string_lossy();
+    let base = stem.strip_suffix("-thumb")?;
+    let ext = thumb_path
+        .extension()
+        .map(|e| e.to_string_lossy().to_string())
+        .unwrap_or_else(|| "jpg".to_string());
+    Some(thumb_path.with_file_name(format!("{}-poster.{}", base, ext)))
+}
+
+/// 视频级 Emby 兼容：将已下载的 thumb 封面复制为同级的 poster（如 xxx-thumb.jpg -> xxx-poster.jpg）
+async fn copy_thumb_to_video_poster(thumb_path: &std::path::Path) -> Result<bool> {
+    let Some(poster_path) = thumb_to_poster_path(thumb_path) else {
+        return Ok(false);
+    };
+    if !thumb_path.exists() {
+        return Ok(false);
+    }
+    ensure_parent_dir_for_file(&poster_path).await?;
+    fs::copy(thumb_path, &poster_path).await?;
+    Ok(true)
+}
+
 pub async fn fetch_page_poster(
     should_run: bool,
     video_model: &video::Model,
@@ -7623,9 +7709,13 @@ pub async fn fetch_page_poster(
             if !fanart_path.exists() && poster_path.exists() {
                 ensure_parent_dir_for_file(&fanart_path).await?;
                 fs::copy(&poster_path, &fanart_path).await?;
+                // 同时补生成视频级 Emby 兼容 poster（复制 thumb）
+                copy_thumb_to_video_poster(&poster_path).await?;
                 return Ok(ExecutionStatus::Succeeded);
             }
         }
+        // 即使 fanart 完好，也补一次 poster（旧库可能缺失）
+        copy_thumb_to_video_poster(&poster_path).await?;
         return Ok(ExecutionStatus::Skipped);
     }
     let single_page = video_model.single_page.context("single_page is null")?;
@@ -7649,6 +7739,8 @@ pub async fn fetch_page_poster(
         ensure_parent_dir_for_file(&fanart_path).await?;
         fs::copy(&poster_path, &fanart_path).await?;
     }
+    // 视频级 Emby 兼容：复制 thumb 作为 poster
+    copy_thumb_to_video_poster(&poster_path).await?;
     Ok(ExecutionStatus::Succeeded)
 }
 
@@ -9679,7 +9771,6 @@ async fn generate_chapter_nfo(
     movie.name = title.as_str();
     movie.original_title = video_model.name.as_str();
     movie.duration = Some(duration_minutes);
-    movie.set = Some(video_model.name.clone());
     movie.sorttitle = Some(sorttitle);
     movie.uniqueid_override = Some(uniqueid);
 
@@ -10081,6 +10172,7 @@ pub async fn fetch_page_subtitle(
     Ok(ExecutionStatus::Succeeded)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn generate_page_nfo(
     should_run: bool,
     video_model: &video::Model,
@@ -10089,6 +10181,7 @@ pub async fn generate_page_nfo(
     _connection: &DatabaseConnection,
     season_number_override: Option<i32>,
     episode_number_override: Option<i32>,
+    video_level_format: bool,
 ) -> Result<ExecutionStatus> {
     if !should_run {
         return Ok(ExecutionStatus::Skipped);
@@ -10100,7 +10193,8 @@ pub async fn generate_page_nfo(
     let nfo = match video_model.single_page {
         Some(single_page) => {
             if single_page {
-                if is_bangumi || video_model.collection_id.is_some() || has_episode_context {
+                // 视频级格式模式下合集视频与普通视频一致：单P 生成 Movie NFO
+                if is_bangumi || has_episode_context || (video_model.collection_id.is_some() && !video_level_format) {
                     // 番剧、合集或已经进入 Season/Episode 命名上下文的单页视频使用 Episode NFO。
                     use crate::utils::nfo::Episode;
                     let mut episode = Episode::from_video_and_page(video_model, page_model);
@@ -10201,8 +10295,12 @@ pub async fn fetch_video_poster(
         if !fanart_path.exists() && poster_path.exists() {
             ensure_parent_dir_for_file(&fanart_path).await?;
             fs::copy(&poster_path, &fanart_path).await?;
+            // 同时补生成视频级 Emby 兼容 poster（复制 thumb）
+            copy_thumb_to_video_poster(&poster_path).await?;
             return Ok(ExecutionStatus::Succeeded);
         }
+        // 即使 fanart 完好，也补一次 poster（旧库可能缺失）
+        copy_thumb_to_video_poster(&poster_path).await?;
         return Ok(ExecutionStatus::Skipped);
     }
 
@@ -10232,6 +10330,9 @@ pub async fn fetch_video_poster(
         _ = token.cancelled() => return Ok(ExecutionStatus::Cancelled),
         res = downloader.fetch_with_fallback(&urls, &poster_path) => res,
     }?;
+
+    // 视频级 Emby 兼容：复制 thumb 作为 poster
+    copy_thumb_to_video_poster(&poster_path).await?;
 
     // 下载fanart背景图
     ensure_parent_dir_for_file(&fanart_path).await?;
@@ -10451,6 +10552,7 @@ pub async fn fetch_bangumi_poster(
     token: CancellationToken,
     custom_poster_url: Option<&str>,
     allow_video_cover_fallback: bool,
+    skip_if_exists: bool,
 ) -> Result<ExecutionStatus> {
     if !should_run {
         return Ok(ExecutionStatus::Skipped);
@@ -10458,11 +10560,12 @@ pub async fn fetch_bangumi_poster(
 
     // 如果目标文件已存在且非空，则跳过重复下载：
     // - 仅对番剧/合集/多P的根目录 poster.jpg / folder.jpg 生效（避免每季/每集都重复拉取）
-    // - SeasonXX-poster.jpg 等“带前缀”的文件不跳过（重置封面时需要可重新下载）
-    let skip_if_exists = matches!(
-        poster_path.file_name().and_then(|n| n.to_str()),
-        Some("poster.jpg") | Some("folder.jpg")
-    );
+    // - 传入 skip_if_exists=false 的文件（如 Season 目录内的封面）不跳过（重置封面时需要可重新下载）
+    let skip_if_exists = skip_if_exists
+        && matches!(
+            poster_path.file_name().and_then(|n| n.to_str()),
+            Some("poster.jpg") | Some("folder.jpg")
+        );
     if skip_if_exists && poster_path.exists() {
         match std::fs::metadata(&poster_path) {
             Ok(meta) if meta.is_file() && meta.len() > 0 => {
@@ -14760,6 +14863,53 @@ mod tests {
         dir
     }
 
+    #[test]
+    fn test_thumb_to_poster_path() {
+        assert_eq!(
+            thumb_to_poster_path(PathBuf::from("/tmp/abc-thumb.jpg").as_path()),
+            Some(PathBuf::from("/tmp/abc-poster.jpg"))
+        );
+        assert_eq!(
+            thumb_to_poster_path(PathBuf::from("/tmp/abc-thumb.webp").as_path()),
+            Some(PathBuf::from("/tmp/abc-poster.webp"))
+        );
+        // 非 -thumb 后缀（如季级 fanart、占位路径）不应生成 poster
+        assert_eq!(
+            thumb_to_poster_path(PathBuf::from("/tmp/Season01-fanart.jpg").as_path()),
+            None
+        );
+        assert_eq!(
+            thumb_to_poster_path(PathBuf::from("/dev/null").as_path()),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_copy_thumb_to_video_poster() {
+        let dir = unique_temp_dir("thumb-poster");
+        fs::create_dir_all(&dir).expect("应能创建临时目录");
+        let thumb_path = dir.join("视频标题-thumb.jpg");
+        fs::write(&thumb_path, b"thumb-data").expect("应能写入thumb文件");
+
+        let copied = copy_thumb_to_video_poster(&thumb_path).await.expect("复制应成功");
+        assert!(copied);
+        let poster_path = dir.join("视频标题-poster.jpg");
+        assert!(poster_path.exists(), "应生成 poster 文件");
+        assert_eq!(
+            fs::read(&poster_path).expect("应能读取poster"),
+            b"thumb-data",
+            "poster 内容应与 thumb 一致"
+        );
+
+        // thumb 不存在时跳过
+        let missing = dir.join("不存在-thumb.jpg");
+        let copied = copy_thumb_to_video_poster(&missing).await.expect("跳过不应报错");
+        assert!(!copied);
+        assert!(!dir.join("不存在-poster.jpg").exists());
+
+        fs::remove_dir_all(&dir).expect("应能清理临时目录");
+    }
+
     async fn insert_test_video_with_status(db: &DatabaseConnection, id: i32, submission_id: i32, download_status: u32) {
         let now = chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
             .unwrap()
@@ -15192,6 +15342,312 @@ mod tests {
             );
         }
         db
+    }
+
+    /// 测试配置包辅助：临时替换全局 CONFIG_BUNDLE，结束后恢复，避免并行测试竞争
+    fn with_test_config<R>(config: crate::config::Config, f: impl FnOnce() -> R) -> R {
+        let previous = crate::config::CONFIG_BUNDLE.load_full();
+        let bundle = crate::config::ConfigBundle::from_config(config).expect("测试配置包应能创建");
+        crate::config::CONFIG_BUNDLE.store(std::sync::Arc::new(bundle));
+        let result = f();
+        crate::config::CONFIG_BUNDLE.store(previous);
+        result
+    }
+
+    fn test_collection_source(aggregate_enabled: bool) -> crate::adapter::VideoSourceEnum {
+        crate::adapter::VideoSourceEnum::Collection(collection::Model {
+            id: 1,
+            s_id: 0,
+            m_id: 0,
+            name: "测试合集".to_string(),
+            r#type: 1,
+            path: "/tmp/collection-1".to_string(),
+            created_at: String::new(),
+            latest_row_at: String::new(),
+            enabled: true,
+            scan_deleted_videos: false,
+            scan_deleted_videos_once: false,
+            filter_option: None,
+            cover: None,
+            keyword_filters: None,
+            keyword_filter_mode: None,
+            blacklist_keywords: None,
+            whitelist_keywords: None,
+            keyword_case_sensitive: false,
+            min_duration_seconds: None,
+            max_duration_seconds: None,
+            published_after: None,
+            published_before: None,
+            episode_order_strategy: 0,
+            aggregate_enabled,
+            aggregate_season_number: None,
+            audio_only: false,
+            audio_only_m4a_only: false,
+            flat_folder: false,
+            split_chapters_after_download: false,
+            download_charge_videos: true,
+            download_danmaku: true,
+            download_subtitle: true,
+            download_ai_subtitle: true,
+            ai_subtitle_language: "zh-CN".to_string(),
+            ai_rename: false,
+            ai_rename_video_prompt: String::new(),
+            ai_rename_audio_prompt: String::new(),
+            ai_rename_enable_multi_page: false,
+            ai_rename_enable_collection: false,
+            ai_rename_enable_bangumi: false,
+            ai_rename_rename_parent_dir: false,
+        })
+    }
+
+    fn test_submission_source() -> crate::adapter::VideoSourceEnum {
+        crate::adapter::VideoSourceEnum::Submission(submission::Model {
+            id: 1,
+            upper_id: 10086,
+            upper_name: "测试UP".to_string(),
+            path: "/tmp/submission-1".to_string(),
+            created_at: String::new(),
+            latest_row_at: String::new(),
+            enabled: true,
+            scan_deleted_videos: false,
+            scan_deleted_videos_once: false,
+            filter_option: None,
+            selected_videos: None,
+            keyword_filters: None,
+            keyword_filter_mode: None,
+            blacklist_keywords: None,
+            whitelist_keywords: None,
+            keyword_case_sensitive: false,
+            min_duration_seconds: None,
+            max_duration_seconds: None,
+            published_after: None,
+            published_before: None,
+            audio_only: false,
+            audio_only_m4a_only: false,
+            flat_folder: false,
+            split_chapters_after_download: false,
+            download_charge_videos: true,
+            download_danmaku: true,
+            download_subtitle: true,
+            download_ai_subtitle: true,
+            ai_subtitle_language: "zh-CN".to_string(),
+            ai_rename: false,
+            ai_rename_video_prompt: String::new(),
+            ai_rename_audio_prompt: String::new(),
+            ai_rename_enable_multi_page: false,
+            ai_rename_enable_collection: false,
+            ai_rename_enable_bangumi: false,
+            ai_rename_rename_parent_dir: false,
+            use_dynamic_api: false,
+            dynamic_api_full_synced: false,
+            last_scan_at: None,
+            next_scan_at: None,
+            no_update_streak: 0,
+        })
+    }
+
+    fn test_bangumi_source() -> crate::adapter::VideoSourceEnum {
+        crate::adapter::VideoSourceEnum::BangumiSource(crate::adapter::BangumiSource {
+            id: 1,
+            name: "测试番剧".to_string(),
+            latest_row_at: String::new(),
+            season_id: None,
+            media_id: None,
+            ep_id: None,
+            path: PathBuf::from("/tmp/bangumi-1"),
+            download_all_seasons: false,
+            page_name_template: None,
+            selected_seasons: None,
+            scan_deleted_videos: false,
+            scan_deleted_videos_once: false,
+            keyword_filters: None,
+            keyword_filter_mode: None,
+            blacklist_keywords: None,
+            whitelist_keywords: None,
+            keyword_case_sensitive: false,
+            min_duration_seconds: None,
+            max_duration_seconds: None,
+            published_after: None,
+            published_before: None,
+            filter_option: None,
+            audio_only: false,
+            audio_only_m4a_only: false,
+            flat_folder: false,
+            split_chapters_after_download: false,
+            download_charge_videos: true,
+            download_danmaku: true,
+            download_subtitle: true,
+            download_ai_subtitle: true,
+            ai_subtitle_language: "zh-CN".to_string(),
+            ai_rename: false,
+            ai_rename_video_prompt: String::new(),
+            ai_rename_audio_prompt: String::new(),
+            ai_rename_enable_multi_page: false,
+            ai_rename_enable_collection: false,
+            ai_rename_enable_bangumi: false,
+            ai_rename_rename_parent_dir: false,
+        })
+    }
+
+    fn test_collection_video_model() -> video::Model {
+        let pubtime = chrono::NaiveDate::from_ymd_opt(2026, 5, 13)
+            .unwrap()
+            .and_hms_opt(12, 34, 56)
+            .unwrap();
+        video::Model {
+            name: "合集测试视频".to_string(),
+            bvid: "BV1Um5k63ERL".to_string(),
+            upper_name: "测试UP".to_string(),
+            upper_id: 10086,
+            collection_id: Some(1),
+            episode_number: Some(3),
+            single_page: Some(true),
+            category: 0,
+            pubtime,
+            favtime: pubtime,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_collection_video_level_format_gating() {
+        let mut config = crate::config::Config::default();
+        config.collection_folder_mode = Cow::Borrowed("separate");
+        config.collection_use_season_structure = false;
+
+        let video = test_collection_video_model();
+
+        // 分离模式 + 结构关闭 + 非聚合合集源 → 视频级格式
+        with_test_config(config.clone(), || {
+            assert!(collection_video_level_format(&test_collection_source(false), &video));
+        });
+
+        // 聚合开启（隐含 Season 结构）→ 保持 Episode/Season 行为
+        with_test_config(config.clone(), || {
+            assert!(!collection_video_level_format(&test_collection_source(true), &video));
+        });
+
+        // 投稿源 UGC 合集（source_submission_id + season_id）→ 视频级格式
+        with_test_config(config.clone(), || {
+            let mut submission_video = test_collection_video_model();
+            submission_video.collection_id = None;
+            submission_video.source_submission_id = Some(1);
+            submission_video.season_id = Some("series_123".to_string());
+            assert!(collection_video_level_format(&test_submission_source(), &submission_video));
+        });
+
+        // 投稿源普通视频（无 season_id）→ 非视频级格式
+        with_test_config(config.clone(), || {
+            let mut submission_video = test_collection_video_model();
+            submission_video.collection_id = None;
+            submission_video.source_submission_id = Some(1);
+            submission_video.season_id = None;
+            assert!(!collection_video_level_format(&test_submission_source(), &submission_video));
+        });
+
+        // 结构选项开启 → 非视频级格式（行为不变）
+        config.collection_use_season_structure = true;
+        with_test_config(config.clone(), || {
+            assert!(!collection_video_level_format(&test_collection_source(false), &video));
+        });
+        config.collection_use_season_structure = false;
+
+        // 统一模式 / up_seasonal → 非视频级格式
+        config.collection_folder_mode = Cow::Borrowed("unified");
+        with_test_config(config.clone(), || {
+            assert!(!collection_video_level_format(&test_collection_source(false), &video));
+        });
+        config.collection_folder_mode = Cow::Borrowed("up_seasonal");
+        with_test_config(config.clone(), || {
+            assert!(!collection_video_level_format(&test_collection_source(false), &video));
+        });
+
+        // 其他源（番剧）→ 非视频级格式
+        config.collection_folder_mode = Cow::Borrowed("separate");
+        with_test_config(config.clone(), || {
+            assert!(!collection_video_level_format(&test_bangumi_source(), &video));
+        });
+    }
+
+    #[tokio::test]
+    async fn test_generate_page_nfo_single_page_collection_video_level_produces_movie() {
+        let db = create_test_db("nfo-video-level-movie").await;
+        let dir = unique_temp_dir("nfo-video-level-movie");
+        let nfo_path = dir.join("视频.nfo");
+        let video = test_collection_video_model();
+        let page = page::Model {
+            name: video.name.clone(),
+            pid: 1,
+            duration: 120,
+            ..Default::default()
+        };
+
+        let status = generate_page_nfo(true, &video, &page, nfo_path.clone(), &db, None, None, true)
+            .await
+            .expect("应能生成视频级 Movie NFO");
+        assert!(matches!(status, ExecutionStatus::Succeeded));
+        let content = fs::read_to_string(&nfo_path).expect("应能读取生成的NFO");
+        assert!(content.contains("<movie>"), "视频级格式单P合集应生成 Movie NFO: {content}");
+        assert!(
+            !content.contains("<episodedetails>"),
+            "视频级格式单P合集不应生成 Episode NFO: {content}"
+        );
+        assert!(content.contains("BV1Um5k63ERL"), "Movie NFO 应包含 bvid uniqueid");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_generate_page_nfo_single_page_collection_normal_mode_produces_episode() {
+        let db = create_test_db("nfo-episode-normal").await;
+        let dir = unique_temp_dir("nfo-episode-normal");
+        let nfo_path = dir.join("视频.nfo");
+        let video = test_collection_video_model();
+        let page = page::Model {
+            name: video.name.clone(),
+            pid: 1,
+            duration: 120,
+            ..Default::default()
+        };
+
+        let status = generate_page_nfo(true, &video, &page, nfo_path.clone(), &db, None, None, false)
+            .await
+            .expect("应能生成 Episode NFO");
+        assert!(matches!(status, ExecutionStatus::Succeeded));
+        let content = fs::read_to_string(&nfo_path).expect("应能读取生成的NFO");
+        assert!(
+            content.contains("<episodedetails>"),
+            "非视频级格式单P合集应生成 Episode NFO: {content}"
+        );
+        assert!(content.contains("<episode>3</episode>"), "应使用合集内序号: {content}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_generate_page_nfo_multi_page_collection_video_level_uses_pid() {
+        let db = create_test_db("nfo-video-level-pid").await;
+        let dir = unique_temp_dir("nfo-video-level-pid");
+        let nfo_path = dir.join("视频P2.nfo");
+        let mut video = test_collection_video_model();
+        video.single_page = Some(false);
+        let page = page::Model {
+            name: "P2".to_string(),
+            pid: 7,
+            duration: 120,
+            ..Default::default()
+        };
+
+        let status = generate_page_nfo(true, &video, &page, nfo_path.clone(), &db, None, Some(7), true)
+            .await
+            .expect("应能生成多P Episode NFO");
+        assert!(matches!(status, ExecutionStatus::Succeeded));
+        let content = fs::read_to_string(&nfo_path).expect("应能读取生成的NFO");
+        assert!(
+            content.contains("<episodedetails>"),
+            "多P视频级格式应生成 Episode NFO: {content}"
+        );
+        assert!(content.contains("<episode>7</episode>"), "分P应使用 pid 编号: {content}");
+        assert!(content.contains("<season>1</season>"), "分P季号应为 1: {content}");
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

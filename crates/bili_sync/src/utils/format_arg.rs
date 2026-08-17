@@ -53,27 +53,19 @@ fn extract_season_number(episode_title: &str) -> i32 {
         let after_di = &title[pos + "第".len()..];
         if let Some(ji_pos) = after_di.find("季") {
             let season_str = &after_di[..ji_pos];
-            // 尝试解析中文数字或阿拉伯数字
-            match season_str {
-                "一" => return 1,
-                "二" => return 2,
-                "三" => return 3,
-                "四" => return 4,
-                "五" => return 5,
-                "六" => return 6,
-                "七" => return 7,
-                "八" => return 8,
-                "九" => return 9,
-                "十" => return 10,
-                _ => {
-                    // 尝试解析阿拉伯数字
-                    if let Ok(season) = season_str.parse::<i32>() {
-                        if season > 0 && season <= 50 {
-                            // 合理的季度范围
-                            return season;
-                        }
-                    }
+            // 尝试解析阿拉伯数字或中文数字（支持 十一、二十 等多位数）
+            if let Ok(season) = season_str.parse::<i32>() {
+                if season > 0 && season <= 50 {
+                    // 合理的季度范围
+                    return season;
                 }
+            }
+            if let Some(season) =
+                crate::utils::bangumi_name_extractor::BangumiNameExtractor::chinese_numeral_to_number(
+                    season_str,
+                )
+            {
+                return season as i32;
             }
         }
     }

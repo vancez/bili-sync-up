@@ -34,6 +34,37 @@ impl BangumiNameExtractor {
 
     /// 从完整标题中提取系列名称和季度信息
     fn extract_from_title(title: &str) -> (String, u32) {
+        // 季度范围模式：B站合并季，如“海绵宝宝 第一季～第九季”、“海绵宝宝 第1-9季”
+        // 取范围起点作为季号，范围本身不进系列名
+        let range_patterns = [
+            // 第X季～第Y季：第一季～第九季、第1季~第9季、第一季-第二季
+            r"(.+?)\s*第([一二三四五六七八九十\d]+)季\s*[～~—–\-至到]\s*第([一二三四五六七八九十\d]+)季\s*(.*)$",
+            // 紧凑形式：第1-9季
+            r"(.+?)\s*第([一二三四五六七八九十\d]+)\s*[～~—–\-至到]\s*([一二三四五六七八九十\d]+)季\s*(.*)$",
+        ];
+        for pattern in &range_patterns {
+            if let Ok(regex) = Regex::new(pattern) {
+                if let Some(captures) = regex.captures(title) {
+                    let base_name_prefix = captures.get(1).map_or("", |m| m.as_str()).trim();
+                    let season_str = captures.get(2).map_or("1", |m| m.as_str());
+                    let base_name_suffix = captures.get(4).map_or("", |m| m.as_str()).trim();
+
+                    // 合并前缀和后缀，中间用空格连接（如果后缀不为空），并清理括号前的空格
+                    let base_name = if !base_name_suffix.is_empty() {
+                        format!("{} {}", base_name_prefix, base_name_suffix)
+                            .replace(" （", "（")  // 去除全角括号前的空格
+                            .replace(" (", "(") // 去除半角括号前的空格
+                    } else {
+                        base_name_prefix.to_string()
+                    };
+
+                    if !base_name.is_empty() {
+                        return (base_name, Self::parse_season_number(season_str));
+                    }
+                }
+            }
+        }
+
         // 常见的季度模式
         let patterns = [
             // 中文季度模式：第一季、第二季、第三季等（保留季度后的后缀标签）
@@ -77,34 +108,19 @@ impl BangumiNameExtractor {
     }
 
     /// 从季度字符串中提取季度数字
+    /// 优先提取“第X季”中的数字片段（避免版本后缀如“中文配音”干扰），再回退到阿拉伯数字
     fn extract_season_number(season_str: &str) -> Option<u32> {
-        // 中文数字映射
-        let chinese_numbers = [
-            ("一", 1),
-            ("二", 2),
-            ("三", 3),
-            ("四", 4),
-            ("五", 5),
-            ("六", 6),
-            ("七", 7),
-            ("八", 8),
-            ("九", 9),
-            ("十", 10),
-        ];
-
-        // 尝试直接解析数字
-        if let Some(number) = Self::extract_number_from_string(season_str) {
-            return Some(number);
-        }
-
-        // 尝试中文数字
-        for (chinese, number) in &chinese_numbers {
-            if season_str.contains(chinese) {
-                return Some(*number);
+        // 提取“第X季”片段，如 “第十一季 中文配音” -> “十一”
+        if let Ok(re) = Regex::new(r"第([一二三四五六七八九十\d]+)季") {
+            if let Some(captures) = re.captures(season_str) {
+                if let Some(mat) = captures.get(1) {
+                    return Some(Self::parse_season_number(mat.as_str()));
+                }
             }
         }
 
-        None
+        // 无“第X季”片段时回退到阿拉伯数字，如 “Season 2”
+        Self::extract_number_from_string(season_str)
     }
 
     /// 解析季度数字（支持中文和阿拉伯数字）
@@ -114,28 +130,50 @@ impl BangumiNameExtractor {
             return number;
         }
 
-        // 尝试中文数字
-        let chinese_numbers = [
-            ("一", 1),
-            ("二", 2),
-            ("三", 3),
-            ("四", 4),
-            ("五", 5),
-            ("六", 6),
-            ("七", 7),
-            ("八", 8),
-            ("九", 9),
-            ("十", 10),
-        ];
+        // 尝试中文数字（如 十一 -> 11、二十一 -> 21）
+        Self::chinese_numeral_to_number(season_str).unwrap_or(1)
+    }
 
-        for (chinese, number) in &chinese_numbers {
-            if season_str.contains(chinese) {
-                return *number;
+    /// 中文数字转阿拉伯数字（十进制解析），支持 一~九十九
+    ///
+    /// 例如：一→1、十→10、十一→11、二十→20、二十一→21
+    /// 遇到非数字字符返回 None
+    pub(crate) fn chinese_numeral_to_number(s: &str) -> Option<u32> {
+        let mut result: u32 = 0;
+        let mut section: u32 = 0;
+        let mut found = false;
+        for ch in s.chars() {
+            match ch {
+                '零' => continue,
+                '一' => section = 1,
+                '二' => section = 2,
+                '三' => section = 3,
+                '四' => section = 4,
+                '五' => section = 5,
+                '六' => section = 6,
+                '七' => section = 7,
+                '八' => section = 8,
+                '九' => section = 9,
+                '十' => {
+                    // “十”单独出现时按 10 处理（如 “十” -> 10）
+                    if section == 0 {
+                        section = 1;
+                    }
+                    result += section * 10;
+                    section = 0;
+                    found = true;
+                    continue;
+                }
+                _ => return None,
             }
+            found = true;
         }
-
-        // 默认返回1
-        1
+        result += section;
+        if found && result > 0 {
+            Some(result)
+        } else {
+            None
+        }
     }
 
     /// 从字符串中提取数字
@@ -279,6 +317,92 @@ mod tests {
         // 测试第一季（没有季度信息）
         let (base_name, season) = BangumiNameExtractor::extract_series_name_and_season("小林家的龙女仆 中配版", None);
         assert_eq!(base_name, "小林家的龙女仆 中配版");
+        assert_eq!(season, 1);
+    }
+
+    #[test]
+    fn test_spongebob_combined_seasons() {
+        // B站合并季：第一季～第九季 -> 取范围起点 1，范围不进系列名
+        let (base_name, season) =
+            BangumiNameExtractor::extract_series_name_and_season("海绵宝宝 第一季～第九季", None);
+        assert_eq!(base_name, "海绵宝宝");
+        assert_eq!(season, 1);
+
+        // 第十季
+        let (base_name, season) = BangumiNameExtractor::extract_series_name_and_season("海绵宝宝 第十季", None);
+        assert_eq!(base_name, "海绵宝宝");
+        assert_eq!(season, 10);
+
+        // 第十一季 中文配音：多位中文数字 + 保留后缀标签
+        let (base_name, season) =
+            BangumiNameExtractor::extract_series_name_and_season("海绵宝宝 第十一季 中文配音", None);
+        assert_eq!(base_name, "海绵宝宝 中文配音");
+        assert_eq!(season, 11);
+    }
+
+    #[test]
+    fn test_season_range_variants() {
+        // 阿拉伯数字范围
+        let (base_name, season) =
+            BangumiNameExtractor::extract_series_name_and_season("海绵宝宝 第1季～第9季", None);
+        assert_eq!(base_name, "海绵宝宝");
+        assert_eq!(season, 1);
+
+        // 紧凑范围形式
+        let (base_name, season) =
+            BangumiNameExtractor::extract_series_name_and_season("海绵宝宝 第1-9季", None);
+        assert_eq!(base_name, "海绵宝宝");
+        assert_eq!(season, 1);
+
+        // 半角波浪线
+        let (base_name, season) =
+            BangumiNameExtractor::extract_series_name_and_season("海绵宝宝 第一季~第九季", None);
+        assert_eq!(base_name, "海绵宝宝");
+        assert_eq!(season, 1);
+    }
+
+    #[test]
+    fn test_chinese_numeral_conversion() {
+        let cases = [
+            ("一", 1),
+            ("二", 2),
+            ("九", 9),
+            ("十", 10),
+            ("十一", 11),
+            ("十二", 12),
+            ("二十", 20),
+            ("二十一", 21),
+            ("九十九", 99),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                BangumiNameExtractor::chinese_numeral_to_number(input),
+                Some(expected),
+                "中文数字 {} 应转换为 {}",
+                input,
+                expected
+            );
+        }
+        assert_eq!(BangumiNameExtractor::chinese_numeral_to_number("abc"), None);
+        assert_eq!(BangumiNameExtractor::chinese_numeral_to_number(""), None);
+    }
+
+    #[test]
+    fn test_season_title_with_suffix() {
+        // season_title 路径：多位数 + 版本后缀不应干扰季号
+        let (base_name, season) = BangumiNameExtractor::extract_series_name_and_season(
+            "海绵宝宝 第十一季 中文配音",
+            Some("第十一季 中文配音"),
+        );
+        assert_eq!(base_name, "海绵宝宝");
+        assert_eq!(season, 11);
+
+        // season_title 为范围时取起点
+        let (base_name, season) = BangumiNameExtractor::extract_series_name_and_season(
+            "海绵宝宝 第一季～第九季",
+            Some("第一季～第九季"),
+        );
+        assert_eq!(base_name, "海绵宝宝");
         assert_eq!(season, 1);
     }
 }

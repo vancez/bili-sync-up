@@ -156,6 +156,7 @@
 	const DEFAULT_CONFIG_VALUES = {
 		interval: 1200,
 		nfoIncludeGenre: true,
+		nfoIncludeBilibiliInfo: true,
 		bindAddress: '0.0.0.0:12345',
 		parallelDownloadThreads: 4,
 		codecs: ['AVC', 'HEV', 'AV1'],
@@ -238,6 +239,7 @@
 	let interval = 1200;
 	let nfoTimeType = 'favtime';
 	let nfoIncludeGenre = true;
+	let nfoIncludeBilibiliInfo = true;
 	let bindAddress = '0.0.0.0:12345';
 	let parallelDownloadEnabled = false;
 	let parallelDownloadThreads = 4;
@@ -616,6 +618,8 @@
 		interval = config.interval || 1200;
 		nfoTimeType = config.nfo_time_type || 'favtime';
 		nfoIncludeGenre = config.nfo_include_genre ?? DEFAULT_CONFIG_VALUES.nfoIncludeGenre;
+		nfoIncludeBilibiliInfo =
+			config.nfo_include_bilibili_info ?? DEFAULT_CONFIG_VALUES.nfoIncludeBilibiliInfo;
 		bindAddress = config.bind_address || '0.0.0.0:12345';
 		parallelDownloadEnabled = config.parallel_download_enabled || false;
 		parallelDownloadThreads = config.parallel_download_threads || 4;
@@ -1035,6 +1039,7 @@
 			interval: normalizeNumberInput(interval, DEFAULT_CONFIG_VALUES.interval),
 			nfo_time_type: nfoTimeType,
 			nfo_include_genre: nfoIncludeGenre,
+			nfo_include_bilibili_info: nfoIncludeBilibiliInfo,
 			bind_address: bindAddress,
 			parallel_download_enabled: parallelDownloadEnabled,
 			parallel_download_threads: normalizeNumberInput(
@@ -2066,6 +2071,24 @@
 				</div>
 				<p class="text-muted-foreground text-sm">
 					关闭后，新生成的 NFO 不再写入 <code>&lt;genre&gt;</code> 标签。
+					<span class="font-medium text-amber-600">注意：</span>
+					更改此设置不会改动已有 NFO 文件，只会影响之后新生成的 NFO。
+				</p>
+			</div>
+
+			<div class="space-y-2">
+				<div class="flex items-center space-x-2">
+					<input
+						type="checkbox"
+						id="nfo-include-bilibili-info"
+						bind:checked={nfoIncludeBilibiliInfo}
+						class="text-primary focus:ring-primary h-4 w-4 rounded border-gray-300"
+					/>
+					<Label for="nfo-include-bilibili-info" class="text-sm">NFO写入B站特有信息（播放量、点赞数）</Label>
+				</div>
+				<p class="text-muted-foreground text-sm">
+					开启后，NFO 会写入 <code>&lt;tag&gt;播放量: xxx&lt;/tag&gt;</code> 和
+					<code>&lt;tag&gt;点赞数: xxx&lt;/tag&gt;</code> 自定义标签。
 					<span class="font-medium text-amber-600">注意：</span>
 					更改此设置不会改动已有 NFO 文件，只会影响之后新生成的 NFO。
 				</p>
